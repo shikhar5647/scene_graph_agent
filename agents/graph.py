@@ -1,6 +1,6 @@
 # agents/graph.py
 from langgraph.graph import StateGraph, START, END
-from langgraph.states import TypedDictState
+from langgraph.prebuilt import TypedDictState
 from agents.nodes import split_report_node, candidate_extractor_node, llm_enricher_node, llm_verifier_node, aggregator_node
 
 # a minimal state typed dict (can be richer)
