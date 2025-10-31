@@ -1,0 +1,42 @@
+# utils/config.py
+SG_OBJECTS = [
+    "left lung",
+    "right lung",
+    "cardiac silhouette",
+    "mediastinum",
+    "left lower lung zone",
+    "right lower lung zone",
+    "right hilar structures",
+    "left hilar structures",
+    "upper mediastinum",
+    "left costophrenic angle",
+    "right costophrenic angle",
+    "left mid lung zone",
+    "right mid lung zone",
+    "aortic arch",
+    "right upper lung zone",
+    "left upper lung zone",
+    "right hemidiaphragm",
+    "right clavicle",
+    "left clavicle",
+    "left hemidiaphragm",
+    "right apical zone",
+    "trachea",
+    "left apical zone",
+    "carina",
+    "svc",
+    "right atrium",
+    "cavoatrial junction",
+    "abdomen",
+    "spine",
+]
+
+# Category IDs commonly used in Chest ImaGenome / SGRRG
+CATEGORY_IDS = [
+    "anatomicalfinding",
+    "disease",
+    "nlp",
+    "technicalassessment",
+    "tubesandlines",
+    "devices",
+]

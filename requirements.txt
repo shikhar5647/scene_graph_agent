@@ -1,0 +1,5 @@
+streamlit
+google-genai       # Google GenAI SDK (Gemini) - quickstart uses `google-genai`
+langgraph        # LangGraph orchestration
+python-dotenv
+regex
