@@ -1,8 +1,16 @@
 # app/streamlit_app.py
 import streamlit as st
-from agents.graph import run_graph
 import json
+import sys
 from pathlib import Path
+import os
+
+# Add the project root directory to Python path
+root_dir = Path(__file__).parent.parent
+if str(root_dir) not in sys.path:
+    sys.path.append(str(root_dir))
+
+from agents.graph import run_graph
 
 st.set_page_config(page_title="Radiology → Scene-Graph (SGRRG style)", layout="wide")
 
