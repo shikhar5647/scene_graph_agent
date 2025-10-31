@@ -1,12 +1,21 @@
 # agents/nodes.py
 import re
+import os
 from typing import Dict, Any, List
+from dotenv import load_dotenv
 from google import genai
 from utils.config import SG_OBJECTS
 from utils.prompts import BASE_ENRICH_PROMPT
 
-# Initialize Gemini client once (client picks up GEMINI_API_KEY from env)
-client = genai.Client()
+# Load environment variables from .env file
+load_dotenv()
+
+# Initialize Gemini client with API key
+api_key = os.getenv("GEMINI_API_KEY")
+if not api_key:
+    raise ValueError("GEMINI_API_KEY not found in environment variables")
+client = genai.Client(api_key=api_key)
+
 
 # Simple sentence splitter - keeps sentence boundaries naive but robust for typical reports
 def split_report_node(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -63,13 +72,10 @@ def llm_enricher_node(state: Dict[str, Any]) -> Dict[str, Any]:
         for p in phrases:
             prompt += f"- {p}\n"
         prompt += "\nProduce a JSON object for this single bounding object with fields: bbox_name, attributes (list of lists), phrases (list). Output only the JSON for the object.\n"
-        # call Gemini 2.5 Pro
+        # call Gemini Pro
         try:
-            response = client.models.generate_content(
-                model="gemini-2.5-pro",
-                contents=prompt
-            )
-            text = response.text if hasattr(response, "text") else response
+            response = client.generate_content(prompt)
+            text = response.text
             # The model should return JSON; attempt to parse it conservatively
             import json
             # try to extract the first JSON block
@@ -108,11 +114,8 @@ def llm_verifier_node(state: Dict[str, Any]) -> Dict[str, Any]:
         "\n\nOutput the corrected JSON."
     )
     try:
-        response = client.models.generate_content(
-            model="gemini-2.5-pro",
-            contents=prompt
-        )
-        text = response.text if hasattr(response, "text") else response
+        response = client.generate_content(prompt)
+        text = response.text
         import re, json
         m = re.search(r'(\{(?:.|\n)*\})', text)
         if m:
