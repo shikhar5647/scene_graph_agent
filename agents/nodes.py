@@ -17,6 +17,49 @@ if not api_key:
 client = genai.Client(api_key=api_key)
 
 
+def _call_llm_safe(prompt: str) -> str:
+    """Call the configured genai client with a variety of possible method names.
+
+    Different versions of the Google GenAI SDK expose different client APIs. This
+    helper tries several call patterns and returns the textual content.
+    """
+    # 1) direct generate_content on client
+    try:
+        if hasattr(client, "generate_content"):
+            resp = client.generate_content(prompt)
+            # resp may be object with .text or a plain string
+            return getattr(resp, "text", str(resp))
+    except Exception:
+        pass
+
+    # 2) client.models.generate_content(model=..., contents=...)
+    try:
+        models = getattr(client, "models", None)
+        if models and hasattr(models, "generate_content"):
+            resp = models.generate_content(model="gemini-2.5-pro", contents=prompt)
+            return getattr(resp, "text", str(resp))
+    except Exception:
+        pass
+
+    # 3) older client.generate or client.generate_text
+    try:
+        if hasattr(client, "generate"):
+            resp = client.generate(prompt)
+            return getattr(resp, "text", str(resp))
+        if hasattr(client, "generate_text"):
+            resp = client.generate_text(prompt)
+            return getattr(resp, "text", str(resp))
+    except Exception:
+        pass
+
+    # 4) last-resort: try to call __call__
+    try:
+        resp = client(prompt)
+        return getattr(resp, "text", str(resp))
+    except Exception as e:
+        raise RuntimeError("No compatible genai client method found or call failed: " + str(e))
+
+
 # Simple sentence splitter - keeps sentence boundaries naive but robust for typical reports
 def split_report_node(state: Dict[str, Any]) -> Dict[str, Any]:
     report: str = state.get("report_text", "").strip()
@@ -74,8 +117,7 @@ def llm_enricher_node(state: Dict[str, Any]) -> Dict[str, Any]:
         prompt += "\nProduce a JSON object for this single bounding object with fields: bbox_name, attributes (list of lists), phrases (list). Output only the JSON for the object.\n"
         # call Gemini Pro
         try:
-            response = client.generate_content(prompt)
-            text = response.text
+            text = _call_llm_safe(prompt)
             # The model should return JSON; attempt to parse it conservatively
             import json
             # try to extract the first JSON block
@@ -114,8 +156,7 @@ def llm_verifier_node(state: Dict[str, Any]) -> Dict[str, Any]:
         "\n\nOutput the corrected JSON."
     )
     try:
-        response = client.generate_content(prompt)
-        text = response.text
+        text = _call_llm_safe(prompt)
         import re, json
         m = re.search(r'(\{(?:.|\n)*\})', text)
         if m:
