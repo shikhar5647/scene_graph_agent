@@ -1,50 +1,277 @@
-# agents/nodes.py (FIXED VERSION WITH DEBUGGING)
+# agents/nodes.py - SGRRG Schema Implementation
 import re
 import os
 import json
 import numpy as np
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Set
 from dotenv import load_dotenv
-from google import genai
 from utils.config import (
-    SG_OBJECTS, SG_ATTRIBUTES, 
+    SG_OBJECTS, SG_ATTRIBUTES, ATTRIBUTE_CATEGORIES,
     OBJECT_TO_IDX, ATTRIBUTE_TO_IDX,
-    NUM_OBJECTS, NUM_ATTRIBUTES
+    NUM_OBJECTS, NUM_ATTRIBUTES,
+    ANATOMICAL_FINDINGS, DISEASE_FINDINGS, TUBES_LINES, DEVICES,
+    TECHNICAL_ASSESSMENT, NLP_DESCRIPTORS, SEVERITY_DESCRIPTORS,
+    TEMPORAL_DESCRIPTORS, TEXTURE_DESCRIPTORS
 )
-from utils.prompts import BASE_ENRICH_PROMPT, VERIFICATION_PROMPT
 
 load_dotenv()
 
-api_key = os.getenv("GEMINI_API_KEY")
-if not api_key:
-    raise ValueError("GEMINI_API_KEY not found in environment variables")
-client = genai.Client(api_key=api_key)
+# Try to initialize Gemini
+try:
+    from google import genai
+    api_key = os.getenv("GEMINI_API_KEY")
+    if api_key:
+        client = genai.Client(api_key=api_key)
+        LLM_AVAILABLE = True
+        print("[INFO] Gemini client initialized")
+    else:
+        LLM_AVAILABLE = False
+        print("[INFO] No API key - using rule-based extraction only")
+except Exception:
+    LLM_AVAILABLE = False
+    print("[INFO] Using rule-based extraction only")
 
 
 def _call_llm_safe(prompt: str) -> str:
-    """Call the configured genai client."""
+    """Call LLM if available."""
+    if not LLM_AVAILABLE:
+        return ""
     try:
         if hasattr(client, "generate_content"):
             resp = client.generate_content(prompt)
             return getattr(resp, "text", str(resp))
-    except Exception:
-        pass
-
-    try:
         models = getattr(client, "models", None)
         if models and hasattr(models, "generate_content"):
             resp = models.generate_content(model="gemini-2.0-flash-exp", contents=prompt)
             return getattr(resp, "text", str(resp))
     except Exception:
         pass
+    return ""
 
-    try:
-        if hasattr(client, "generate"):
-            resp = client.generate(prompt)
-            return getattr(resp, "text", str(resp))
-    except Exception as e:
-        raise RuntimeError("No compatible genai client method found: " + str(e))
 
+# ============================================================================
+# COMPREHENSIVE RULE-BASED EXTRACTION (SGRRG Schema)
+# ============================================================================
+
+def extract_findings_rule_based(text: str, object_name: str) -> Dict[str, int]:
+    """
+    Extract findings using comprehensive SGRRG attribute patterns.
+    Returns: {attribute: value} where value ∈ {-1, 0, +1}
+    """
+    text_lower = text.lower()
+    findings = {}
+    
+    # ========================================================================
+    # PATTERN DEFINITIONS FOR ALL ATTRIBUTES
+    # ========================================================================
+    
+    # POSITIVE patterns (attribute present = +1)
+    positive_patterns = {
+        # Anatomical
+        'normal': [r'\bnormal\b', r'unremarkable', r'within normal limits'],
+        'clear': [r'\bclear\b', r'well aerated'],
+        'hyperinflated': [r'hyperinflat'],
+        'hyperlucent': [r'hyperlucen'],
+        'low lung volumes': [r'low\s+(?:lung\s+)?volumes'],
+        'elevated': [r'elevated', r'elevation'],
+        'flattened': [r'flattened'],
+        'displaced': [r'displaced', r'displacement'],
+        'enlarged': [r'enlarged', r'enlargement'],
+        'tortuous': [r'tortuous'],
+        'ectatic': [r'ectatic', r'ectasia'],
+        'unfolded': [r'unfolded'],
+        
+        # Diseases
+        'opacity': [r'opacit(?:y|ies)', r'infiltrat', r'densit(?:y|ies)'],
+        'consolidation': [r'consolidation', r'consolidate'],
+        'infiltrate': [r'infiltrat'],
+        'atelectasis': [r'atelectasis', r'atelectatic'],
+        'collapse': [r'\bcollapse\b', r'collapsed'],
+        'pleural effusion': [r'pleural\s+effusion', r'\beffusion\b'],
+        'pneumothorax': [r'pneumothorax', r'ptx'],
+        'pneumomediastinum': [r'pneumomediastinum'],
+        'subcutaneous emphysema': [r'subcutaneous\s+emphysema'],
+        'pulmonary edema': [r'pulmonary\s+edema', r'\bedema\b'],
+        'vascular congestion': [r'vascular\s+congestion', r'congestion'],
+        'cardiomegaly': [r'cardiomegaly', r'cardiac\s+enlargement'],
+        'mass': [r'\bmass\b', r'masses'],
+        'nodule': [r'nodule', r'nodular'],
+        'lesion': [r'lesion'],
+        'granuloma': [r'granuloma'],
+        'calcification': [r'calcification', r'calcified', r'calcific'],
+        'fibrosis': [r'fibrosis', r'fibrotic'],
+        'scarring': [r'scar(?:ring)?'],
+        'thickening': [r'thickening', r'thickened'],
+        'pleural thickening': [r'pleural\s+thickening'],
+        'interstitial thickening': [r'interstitial(?:\s+thickening)?'],
+        'blunted costophrenic angle': [r'blunted\s+(?:costophrenic\s+)?angle', r'blunting'],
+        'pneumonia': [r'pneumonia'],
+        'infection': [r'infection', r'infectious'],
+        'fracture': [r'fracture'],
+        'degenerative changes': [r'degenerative'],
+        'hilar enlargement': [r'hilar\s+enlargement', r'enlarged\s+hil'],
+        'lymphadenopathy': [r'lymphadenopathy', r'adenopathy'],
+        'mediastinal widening': [r'mediastinal\s+widening', r'widened\s+mediastinum'],
+        
+        # Tubes/Lines
+        'endotracheal tube': [r'endotracheal\s+tube', r'\bet\s+tube\b', r'\bett\b'],
+        'nasogastric tube': [r'nasogastric\s+tube', r'\bng\s+tube\b', r'\bngt\b'],
+        'chest tube': [r'chest\s+tube'],
+        'central line': [r'central\s+(?:venous\s+)?(?:line|catheter)', r'\bcvc\b'],
+        
+        # Devices
+        'pacemaker': [r'pacemaker'],
+        'icd': [r'\bicd\b', r'aicd', r'defibrillator'],
+        'prosthetic valve': [r'prosthetic\s+valve', r'valve\s+replacement'],
+        'surgical clips': [r'surgical\s+clips', r'\bclips\b'],
+        'sternotomy wires': [r'sternotomy\s+wires', r'sternal\s+wires'],
+        
+        # Technical
+        'rotated': [r'rotated', r'rotation'],
+        'lordotic': [r'lordotic'],
+        'underpenetrated': [r'underpenetrated'],
+        'overpenetrated': [r'overpenetrated'],
+        
+        # NLP descriptors
+        'focal': [r'\bfocal\b'],
+        'diffuse': [r'diffuse'],
+        'patchy': [r'patchy'],
+        'multifocal': [r'multifocal'],
+        'bilateral': [r'bilateral', r'\bboth\b', r'bilaterally'],
+        'unilateral': [r'unilateral'],
+        'asymmetric': [r'asymmetric'],
+        'symmetric': [r'symmetric'],
+        'peripheral': [r'peripheral'],
+        'central': [r'central'],
+        'basilar': [r'basilar', r'\bbase\b', r'bases'],
+        'apical': [r'apical', r'\bapex\b', r'apices'],
+        'perihilar': [r'perihilar'],
+        'retrocardiac': [r'retrocardiac'],
+        
+        # Severity
+        'mild': [r'\bmild\b', r'mildly'],
+        'moderate': [r'moderate', r'moderately'],
+        'severe': [r'severe', r'severely'],
+        'minimal': [r'minimal', r'minimally'],
+        'small': [r'\bsmall\b'],
+        'large': [r'\blarge\b'],
+        'extensive': [r'extensive'],
+        'marked': [r'marked', r'markedly'],
+        'significant': [r'significant'],
+        
+        # Temporal
+        'acute': [r'\bacute\b', r'acutely'],
+        'chronic': [r'chronic', r'chronically'],
+        'subacute': [r'subacute'],
+        'new': [r'\bnew\b', r'newly'],
+        'old': [r'\bold\b'],
+        'stable': [r'stable'],
+        'unchanged': [r'unchanged'],
+        'improved': [r'improved', r'improving', r'improvement'],
+        'worsened': [r'worsened', r'worsening'],
+        'progressive': [r'progressive'],
+        'resolving': [r'resolving'],
+        'persistent': [r'persistent'],
+        
+        # Texture
+        'hazy': [r'hazy'],
+        'dense': [r'\bdense\b'],
+        'ground glass': [r'ground\s+glass'],
+        'reticular': [r'reticular'],
+        'linear': [r'linear'],
+        'streaky': [r'streaky'],
+        'fluffy': [r'fluffy'],
+        'confluent': [r'confluent'],
+        'scattered': [r'scattered'],
+    }
+    
+    # NEGATIVE patterns (explicitly absent = 0)
+    negative_patterns = {
+        'opacity': [r'no\s+opacit', r'clear\s+of\s+opacit', r'without\s+opacit'],
+        'consolidation': [r'no\s+consolidation', r'clear\s+of\s+consolidation', r'without\s+consolidation'],
+        'pleural effusion': [r'no\s+(?:pleural\s+)?effusion', r'without\s+effusion'],
+        'pneumothorax': [r'no\s+pneumothorax'],
+        'cardiomegaly': [r'no\s+cardiomegaly', r'normal\s+cardiac\s+size'],
+        'enlarged': [r'not\s+enlarged', r'normal\s+(?:in\s+)?size'],
+        'atelectasis': [r'no\s+atelectasis'],
+        'mass': [r'no\s+mass'],
+        'nodule': [r'no\s+nodule'],
+        'fracture': [r'no\s+fracture'],
+        'pulmonary edema': [r'no\s+(?:pulmonary\s+)?edema'],
+        'infiltrate': [r'no\s+infiltrat'],
+        'acute': [r'no\s+acute'],
+    }
+    
+    # UNCERTAIN patterns (suspicious/possible = -1)
+    uncertain_patterns = {
+        'consolidation': [r'suspicious\s+for.*consolidation', r'possible.*consolidation', r'(?:may|might|could)\s+(?:be|represent).*consolidation'],
+        'opacity': [r'suspicious\s+for.*opacit', r'possible.*opacit', r'questionable.*opacit'],
+        'mass': [r'suspicious\s+(?:for\s+)?mass', r'possible\s+mass'],
+        'pneumothorax': [r'possible\s+pneumothorax', r'questionable\s+pneumothorax'],
+        'pneumonia': [r'suspicious\s+for.*pneumonia', r'possible.*pneumonia', r'concerning\s+for.*pneumonia'],
+        'infection': [r'suspicious\s+for.*infection', r'concerning\s+for.*infection(?:ous)?'],
+        'malignancy': [r'suspicious\s+for.*malignan', r'concerning\s+for.*malignan'],
+        'pleural effusion': [r'possible.*effusion', r'questionable.*effusion'],
+    }
+    
+    # ========================================================================
+    # EXTRACTION LOGIC
+    # ========================================================================
+    
+    # 1. Check UNCERTAIN first (highest priority)
+    for attr, patterns in uncertain_patterns.items():
+        if attr in ATTRIBUTE_TO_IDX:
+            for pattern in patterns:
+                if re.search(pattern, text_lower):
+                    findings[attr] = -1
+                    break
+    
+    # 2. Check NEGATIVE patterns
+    for attr, patterns in negative_patterns.items():
+        if attr in ATTRIBUTE_TO_IDX and attr not in findings:
+            for pattern in patterns:
+                if re.search(pattern, text_lower):
+                    findings[attr] = 0
+                    break
+    
+    # 3. Check POSITIVE patterns
+    for attr, patterns in positive_patterns.items():
+        if attr in ATTRIBUTE_TO_IDX and attr not in findings:
+            for pattern in patterns:
+                if re.search(pattern, text_lower):
+                    findings[attr] = 1
+                    break
+    
+    # ========================================================================
+    # OBJECT-SPECIFIC LOGIC
+    # ========================================================================
+    
+    obj_lower = object_name.lower()
+    
+    # Cardiac objects
+    if 'cardiac' in obj_lower or 'heart' in obj_lower:
+        if findings.get('normal') == 1:
+            findings['enlarged'] = 0
+            findings['cardiomegaly'] = 0
+    
+    # Lung objects
+    if 'lung' in obj_lower:
+        if findings.get('clear') == 1:
+            findings.setdefault('consolidation', 0)
+            findings.setdefault('opacity', 0)
+            findings.setdefault('infiltrate', 0)
+    
+    # Costophrenic angles - effusion relationship
+    if 'costophrenic' in obj_lower:
+        if findings.get('blunted costophrenic angle') == 1:
+            findings['pleural effusion'] = -1  # Suggests but not confirms
+    
+    return findings
+
+
+# ============================================================================
+# PIPELINE NODES
+# ============================================================================
 
 def split_report_node(state: Dict[str, Any]) -> Dict[str, Any]:
     """Split report into sentences."""
@@ -55,12 +282,13 @@ def split_report_node(state: Dict[str, Any]) -> Dict[str, Any]:
     sentences = []
     for line in report.splitlines():
         line = line.strip()
-        if not line:
+        if not line or line.startswith('Exam:'):
             continue
-        parts = re.split(r'(?<=[\.\?!])\s+', line)
+        # Split on periods
+        parts = re.split(r'(?<!\d)\.(?!\d)\s+', line)
         for p in parts:
             p = p.strip()
-            if p:
+            if p and len(p) > 5:
                 sentences.append(p)
     
     print(f"[DEBUG] Split into {len(sentences)} sentences")
@@ -69,212 +297,140 @@ def split_report_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def candidate_extractor_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Extract candidate object mentions - ENHANCED VERSION."""
+    """Extract object mentions with comprehensive pattern matching."""
     sentences: List[str] = state.get("sentences", [])
-    candidate_map = {o: [] for o in SG_OBJECTS}
+    candidate_map = {}
     
-    # Improved matching with keyword expansion
-    object_keywords = {
-        "left lung": ["left lung", "left side", "left hemithorax"],
-        "right lung": ["right lung", "right side", "right hemithorax"],
-        "cardiac silhouette": ["cardiac silhouette", "heart", "cardiac"],
-        "left lower lung zone": ["left lower lung zone", "left lower lobe", "left base"],
-        "right lower lung zone": ["right lower lung zone", "right lower lobe", "right base"],
-        "left mid lung zone": ["left mid lung zone", "left middle"],
-        "right mid lung zone": ["right mid lung zone", "right middle", "right mid"],
-        "left upper lung zone": ["left upper lung zone", "left upper lobe", "left apex"],
-        "right upper lung zone": ["right upper lung zone", "right upper lobe", "right apex"],
-        "left costophrenic angle": ["left costophrenic", "left cp angle"],
-        "right costophrenic angle": ["right costophrenic", "right cp angle"],
-        "mediastinum": ["mediastinum", "mediastinal"],
-        "spine": ["spine", "vertebra", "osseous"],
-        "left hemidiaphragm": ["left hemidiaphragm", "left diaphragm"],
-        "right hemidiaphragm": ["right hemidiaphragm", "right diaphragm"],
+    # Object detection patterns
+    object_patterns = {
+        "cardiac silhouette": [r'cardiac(?:\s+silhouette)?', r'\bheart\b', r'cardiomegaly'],
+        "left lung": [r'left\s+lung', r'left\s+hemithorax', r'on\s+the\s+left(?!\s+(?:lower|mid|upper))'],
+        "right lung": [r'right\s+lung', r'right\s+hemithorax', r'on\s+the\s+right(?!\s+(?:lower|mid|upper))'],
+        "left lower lung zone": [r'left\s+lower\s+(?:lung\s+)?(?:zone|lobe)', r'left\s+base', r'left\s+basilar'],
+        "right lower lung zone": [r'right\s+lower\s+(?:lung\s+)?(?:zone|lobe)', r'right\s+base', r'right\s+basilar'],
+        "left mid lung zone": [r'left\s+mid(?:dle)?\s+(?:lung\s+)?zone', r'left\s+mid\s+lobe'],
+        "right mid lung zone": [r'right\s+mid(?:dle)?\s+(?:lung\s+)?zone', r'right\s+mid\s+lobe'],
+        "left upper lung zone": [r'left\s+upper\s+(?:lung\s+)?(?:zone|lobe)', r'left\s+apex', r'left\s+apical'],
+        "right upper lung zone": [r'right\s+upper\s+(?:lung\s+)?(?:zone|lobe)', r'right\s+apex', r'right\s+apical'],
+        "left apical zone": [r'left\s+apical?\s+zone', r'left\s+apex'],
+        "right apical zone": [r'right\s+apical?\s+zone', r'right\s+apex'],
+        "left costophrenic angle": [r'left\s+costophrenic', r'left\s+cp\s+angle'],
+        "right costophrenic angle": [r'right\s+costophrenic', r'right\s+cp\s+angle'],
+        "left hemidiaphragm": [r'left\s+(?:hemi)?diaphragm'],
+        "right hemidiaphragm": [r'right\s+(?:hemi)?diaphragm'],
+        "mediastinum": [r'mediastin'],
+        "upper mediastinum": [r'upper\s+mediastin', r'superior\s+mediastin'],
+        "left hilar structures": [r'left\s+hil(?:ar|um)'],
+        "right hilar structures": [r'right\s+hil(?:ar|um)'],
+        "aortic arch": [r'aortic\s+arch', r'\baorta\b'],
+        "trachea": [r'trachea'],
+        "carina": [r'carina'],
+        "spine": [r'spine', r'vertebra', r'osseous'],
+        "left clavicle": [r'left\s+clavicle'],
+        "right clavicle": [r'right\s+clavicle'],
     }
     
     for s in sentences:
-        s_low = s.lower()
-        matched_objects = set()
+        s_lower = s.lower()
         
-        # Try keyword matching
-        for obj, keywords in object_keywords.items():
-            for keyword in keywords:
-                if keyword in s_low:
-                    candidate_map[obj].append(s)
-                    matched_objects.add(obj)
+        for obj_name, patterns in object_patterns.items():
+            for pattern in patterns:
+                if re.search(pattern, s_lower):
+                    if obj_name not in candidate_map:
+                        candidate_map[obj_name] = []
+                    if s not in candidate_map[obj_name]:
+                        candidate_map[obj_name].append(s)
                     break
         
-        # Fallback: direct substring match for all objects
-        for obj in SG_OBJECTS:
-            if obj not in matched_objects and obj.lower() in s_low:
-                candidate_map[obj].append(s)
-                matched_objects.add(obj)
+        # Special cases
+        if re.search(r'pleural\s+effusion|effusion', s_lower):
+            for obj in ["left costophrenic angle", "right costophrenic angle"]:
+                if obj not in candidate_map:
+                    candidate_map[obj] = []
+                if s not in candidate_map[obj]:
+                    candidate_map[obj].append(s)
         
-        # Special handling for "pleural effusion" - affects costophrenic angles
-        if "pleural effusion" in s_low or "effusion" in s_low:
-            if "left costophrenic angle" not in matched_objects:
-                candidate_map["left costophrenic angle"].append(s)
-            if "right costophrenic angle" not in matched_objects:
-                candidate_map["right costophrenic angle"].append(s)
+        # If "lungs" mentioned without side, add to both
+        if re.search(r'\blungs\b', s_lower) and not re.search(r'left|right', s_lower):
+            for obj in ["left lung", "right lung"]:
+                if obj not in candidate_map:
+                    candidate_map[obj] = []
+                if s not in candidate_map[obj]:
+                    candidate_map[obj].append(s)
     
-    # Keep only objects with sentences
-    candidate_map = {k: list(set(v)) for k, v in candidate_map.items() if v}
-    
-    print(f"[DEBUG] Found candidates for {len(candidate_map)} objects:")
-    for obj, phrases in candidate_map.items():
-        print(f"  - {obj}: {len(phrases)} phrases")
-    
+    print(f"\n[DEBUG] Found {len(candidate_map)} objects with mentions")
     state["candidates"] = candidate_map
     return {"candidates": candidate_map}
 
 
 def llm_enricher_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Extract attributes using LLM - SIMPLIFIED & ROBUST."""
+    """Extract findings using rule-based + optional LLM enhancement."""
     candidates: Dict[str, List[str]] = state.get("candidates", {})
     if not candidates:
-        print("[DEBUG] No candidates to enrich")
         return {"findings_dict": {}}
     
     findings_dict = {}
     
-    for bbox_name, phrases in candidates.items():
-        # Create focused prompt
-        prompt = f"""Extract radiology findings for: {bbox_name}
-
-Report sentences:
-{chr(10).join(f"- {p}" for p in phrases)}
-
-For this anatomical region, identify which attributes apply:
-- Use ONLY these attributes: {', '.join(SG_ATTRIBUTES[:30])}  (showing first 30)
-- Return format: {{"attribute_name": value}}
-- Values: +1 (present), 0 (explicitly absent), -1 (uncertain/suspicious)
-
-Examples:
-- "normal in size" → {{"normal": 1, "enlarged": 0}}
-- "no pleural effusion" → {{"pleural effusion": 0}}
-- "suspicious for consolidation" → {{"consolidation": -1}}
-- "patchy opacities" → {{"opacity": 1, "patchy": 1}}
-
-Return ONLY a JSON object with attributes and values. No explanation.
-"""
+    for obj_name, phrases in candidates.items():
+        combined_text = " ".join(phrases)
         
-        try:
-            text = _call_llm_safe(prompt)
-            print(f"[DEBUG] LLM response for {bbox_name}:")
-            print(f"  {text[:200]}...")
-            
-            # Extract JSON more robustly
-            text = text.strip()
-            # Remove markdown code blocks
-            text = re.sub(r'```json\s*', '', text)
-            text = re.sub(r'```\s*', '', text)
-            
-            # Find JSON object
-            match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', text)
-            if match:
-                json_text = match.group(0)
-                attr_dict = json.loads(json_text)
-                
-                # Normalize keys to lowercase
-                attr_dict = {k.lower().strip(): v for k, v in attr_dict.items()}
-                
-                findings_dict[bbox_name] = attr_dict
-                print(f"  ✓ Extracted {len(attr_dict)} attributes")
-            else:
-                print(f"  ✗ No JSON found")
-                findings_dict[bbox_name] = {}
-                
-        except Exception as e:
-            print(f"  ✗ Error: {e}")
-            findings_dict[bbox_name] = {}
+        # Always use rule-based
+        rule_findings = extract_findings_rule_based(combined_text, obj_name)
+        
+        print(f"\n[{obj_name}]")
+        print(f"  Sentences: {len(phrases)}")
+        print(f"  Rule findings: {len(rule_findings)} attributes")
+        
+        findings_dict[obj_name] = rule_findings
     
-    print(f"[DEBUG] Enrichment complete: {len(findings_dict)} objects with findings")
     state["findings_dict"] = findings_dict
     return {"findings_dict": findings_dict}
 
 
 def llm_verifier_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Verify findings - LIGHTWEIGHT VERSION."""
+    """Verify findings are valid."""
     findings = state.get("findings_dict", {})
-    if not findings:
-        return {"verified_findings": {}}
     
     verified = {}
-    
-    # Simple verification: ensure values are -1, 0, or 1
     for obj_name, attr_dict in findings.items():
-        verified_attrs = {}
-        for attr, value in attr_dict.items():
-            try:
-                val = int(value)
-                if val in [-1, 0, 1]:
-                    verified_attrs[attr] = val
-                elif val > 0:
-                    verified_attrs[attr] = 1
-                elif val < 0:
-                    verified_attrs[attr] = -1
-            except:
-                pass
-        
+        verified_attrs = {k: v for k, v in attr_dict.items() if v in [-1, 0, 1]}
         if verified_attrs:
             verified[obj_name] = verified_attrs
     
-    print(f"[DEBUG] Verified {len(verified)} objects")
     state["verified_findings"] = verified
     return {"verified_findings": verified}
 
 
 def matrix_builder_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Build matrix with FLEXIBLE attribute matching."""
+    """Build the 29×180 SGRRG matrix."""
     findings: Dict[str, Dict[str, int]] = state.get("verified_findings", {})
     
     matrix = np.zeros((NUM_OBJECTS, NUM_ATTRIBUTES), dtype=np.int8)
     
-    # Track what we matched
-    matched_count = 0
-    unmatched_attrs = []
+    print(f"\n[DEBUG] Building {NUM_OBJECTS}×{NUM_ATTRIBUTES} matrix...")
     
+    matched = 0
     for obj_name, attr_dict in findings.items():
         if obj_name not in OBJECT_TO_IDX:
-            print(f"[DEBUG] Unknown object: {obj_name}")
             continue
         
         obj_idx = OBJECT_TO_IDX[obj_name]
         
         for attr_name, value in attr_dict.items():
-            attr_name_clean = attr_name.lower().strip()
-            
-            # Direct match
-            if attr_name_clean in ATTRIBUTE_TO_IDX:
-                attr_idx = ATTRIBUTE_TO_IDX[attr_name_clean]
+            if attr_name in ATTRIBUTE_TO_IDX:
+                attr_idx = ATTRIBUTE_TO_IDX[attr_name]
                 matrix[obj_idx, attr_idx] = value
-                matched_count += 1
-                continue
-            
-            # Fuzzy match: check if attr_name contains any known attribute
-            matched = False
-            for known_attr in SG_ATTRIBUTES:
-                if known_attr in attr_name_clean or attr_name_clean in known_attr:
-                    attr_idx = ATTRIBUTE_TO_IDX[known_attr]
-                    matrix[obj_idx, attr_idx] = value
-                    matched_count += 1
-                    matched = True
-                    break
-            
-            if not matched:
-                unmatched_attrs.append(attr_name_clean)
+                matched += 1
     
-    print(f"[DEBUG] Matrix populated: {matched_count} cells")
-    print(f"[DEBUG] Non-zero entries: {np.count_nonzero(matrix)}")
-    if unmatched_attrs:
-        print(f"[DEBUG] Unmatched attributes: {set(unmatched_attrs)}")
+    print(f"  Populated: {matched} cells")
+    print(f"  Non-zero: {np.count_nonzero(matrix)}")
     
     state["scene_graph_matrix"] = matrix
     return {"scene_graph_matrix": matrix}
 
 
 def aggregator_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Final aggregation."""
+    """Final aggregation with statistics."""
     matrix = state.get("scene_graph_matrix")
     findings = state.get("verified_findings", {})
     
@@ -284,29 +440,27 @@ def aggregator_node(state: Dict[str, Any]) -> Dict[str, Any]:
     metadata = {
         "objects": SG_OBJECTS,
         "attributes": SG_ATTRIBUTES,
-        "matrix_shape": matrix.shape,
-        "value_legend": {
-            "+1": "present",
-            "0": "absent/not mentioned",
-            "-1": "uncertain"
-        },
+        "attribute_categories": ATTRIBUTE_CATEGORIES,
+        "matrix_shape": list(matrix.shape),
+        "value_legend": {"+1": "present", "0": "absent", "-1": "uncertain"},
         "findings_summary": findings,
         "statistics": {
             "total_cells": int(matrix.size),
             "positive": int(np.sum(matrix == 1)),
             "negative": int(np.sum(matrix == 0)),
             "uncertain": int(np.sum(matrix == -1)),
+            "non_zero": int(np.count_nonzero(matrix)),
             "coverage": float(np.sum(matrix != 0) / matrix.size * 100)
         }
     }
     
-    print(f"[DEBUG] Final matrix shape: {matrix.shape}")
-    print(f"[DEBUG] Statistics: {metadata['statistics']}")
+    print(f"\n[FINAL] Matrix: {matrix.shape}")
+    print(f"  +1: {metadata['statistics']['positive']}")
+    print(f"  0: {metadata['statistics']['negative']}")
+    print(f"  -1: {metadata['statistics']['uncertain']}")
+    print(f"  Coverage: {metadata['statistics']['coverage']:.2f}%")
     
     state["final_matrix"] = matrix
     state["metadata"] = metadata
     
-    return {
-        "final_matrix": matrix,
-        "metadata": metadata
-    }
+    return {"final_matrix": matrix, "metadata": metadata}
