@@ -1,6 +1,7 @@
-# agents/nodes.py
+# agents/nodes.py (FIXED VERSION WITH DEBUGGING)
 import re
 import os
+import json
 import numpy as np
 from typing import Dict, Any, List
 from dotenv import load_dotenv
@@ -12,10 +13,8 @@ from utils.config import (
 )
 from utils.prompts import BASE_ENRICH_PROMPT, VERIFICATION_PROMPT
 
-# Load environment variables from .env file
 load_dotenv()
 
-# Initialize Gemini client with API key
 api_key = os.getenv("GEMINI_API_KEY")
 if not api_key:
     raise ValueError("GEMINI_API_KEY not found in environment variables")
@@ -23,8 +22,7 @@ client = genai.Client(api_key=api_key)
 
 
 def _call_llm_safe(prompt: str) -> str:
-    """Call the configured genai client with a variety of possible method names."""
-    # 1) direct generate_content on client
+    """Call the configured genai client."""
     try:
         if hasattr(client, "generate_content"):
             resp = client.generate_content(prompt)
@@ -32,7 +30,6 @@ def _call_llm_safe(prompt: str) -> str:
     except Exception:
         pass
 
-    # 2) client.models.generate_content(model=..., contents=...)
     try:
         models = getattr(client, "models", None)
         if models and hasattr(models, "generate_content"):
@@ -41,23 +38,12 @@ def _call_llm_safe(prompt: str) -> str:
     except Exception:
         pass
 
-    # 3) older client.generate or client.generate_text
     try:
         if hasattr(client, "generate"):
             resp = client.generate(prompt)
             return getattr(resp, "text", str(resp))
-        if hasattr(client, "generate_text"):
-            resp = client.generate_text(prompt)
-            return getattr(resp, "text", str(resp))
-    except Exception:
-        pass
-
-    # 4) last-resort: try to call __call__
-    try:
-        resp = client(prompt)
-        return getattr(resp, "text", str(resp))
     except Exception as e:
-        raise RuntimeError("No compatible genai client method found or call failed: " + str(e))
+        raise RuntimeError("No compatible genai client method found: " + str(e))
 
 
 def split_report_node(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -77,142 +63,224 @@ def split_report_node(state: Dict[str, Any]) -> Dict[str, Any]:
             if p:
                 sentences.append(p)
     
+    print(f"[DEBUG] Split into {len(sentences)} sentences")
     state["sentences"] = sentences
     return {"sentences": sentences}
 
 
 def candidate_extractor_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Extract candidate object mentions from sentences."""
+    """Extract candidate object mentions - ENHANCED VERSION."""
     sentences: List[str] = state.get("sentences", [])
     candidate_map = {o: [] for o in SG_OBJECTS}
-    lowered_objs = [(o, o.lower()) for o in SG_OBJECTS]
+    
+    # Improved matching with keyword expansion
+    object_keywords = {
+        "left lung": ["left lung", "left side", "left hemithorax"],
+        "right lung": ["right lung", "right side", "right hemithorax"],
+        "cardiac silhouette": ["cardiac silhouette", "heart", "cardiac"],
+        "left lower lung zone": ["left lower lung zone", "left lower lobe", "left base"],
+        "right lower lung zone": ["right lower lung zone", "right lower lobe", "right base"],
+        "left mid lung zone": ["left mid lung zone", "left middle"],
+        "right mid lung zone": ["right mid lung zone", "right middle", "right mid"],
+        "left upper lung zone": ["left upper lung zone", "left upper lobe", "left apex"],
+        "right upper lung zone": ["right upper lung zone", "right upper lobe", "right apex"],
+        "left costophrenic angle": ["left costophrenic", "left cp angle"],
+        "right costophrenic angle": ["right costophrenic", "right cp angle"],
+        "mediastinum": ["mediastinum", "mediastinal"],
+        "spine": ["spine", "vertebra", "osseous"],
+        "left hemidiaphragm": ["left hemidiaphragm", "left diaphragm"],
+        "right hemidiaphragm": ["right hemidiaphragm", "right diaphragm"],
+    }
     
     for s in sentences:
         s_low = s.lower()
-        for obj, obj_low in lowered_objs:
-            if obj_low in s_low:
+        matched_objects = set()
+        
+        # Try keyword matching
+        for obj, keywords in object_keywords.items():
+            for keyword in keywords:
+                if keyword in s_low:
+                    candidate_map[obj].append(s)
+                    matched_objects.add(obj)
+                    break
+        
+        # Fallback: direct substring match for all objects
+        for obj in SG_OBJECTS:
+            if obj not in matched_objects and obj.lower() in s_low:
                 candidate_map[obj].append(s)
+                matched_objects.add(obj)
+        
+        # Special handling for "pleural effusion" - affects costophrenic angles
+        if "pleural effusion" in s_low or "effusion" in s_low:
+            if "left costophrenic angle" not in matched_objects:
+                candidate_map["left costophrenic angle"].append(s)
+            if "right costophrenic angle" not in matched_objects:
+                candidate_map["right costophrenic angle"].append(s)
     
-    # Keep only objects with associated sentences
-    candidate_map = {k: v for k, v in candidate_map.items() if v}
+    # Keep only objects with sentences
+    candidate_map = {k: list(set(v)) for k, v in candidate_map.items() if v}
+    
+    print(f"[DEBUG] Found candidates for {len(candidate_map)} objects:")
+    for obj, phrases in candidate_map.items():
+        print(f"  - {obj}: {len(phrases)} phrases")
+    
     state["candidates"] = candidate_map
     return {"candidates": candidate_map}
 
 
 def llm_enricher_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Use LLM to extract attributes for each object mention."""
+    """Extract attributes using LLM - SIMPLIFIED & ROBUST."""
     candidates: Dict[str, List[str]] = state.get("candidates", {})
     if not candidates:
+        print("[DEBUG] No candidates to enrich")
         return {"findings_dict": {}}
     
     findings_dict = {}
     
     for bbox_name, phrases in candidates.items():
-        prompt = BASE_ENRICH_PROMPT + "\n\n"
-        prompt += f"Target anatomical object: {bbox_name}\n\n"
-        prompt += "Report sentences mentioning this object:\n"
-        for p in phrases:
-            prompt += f"- {p}\n"
-        prompt += "\nExtract attributes and their status (+1, 0, or -1) for this object. Output only JSON.\n"
+        # Create focused prompt
+        prompt = f"""Extract radiology findings for: {bbox_name}
+
+Report sentences:
+{chr(10).join(f"- {p}" for p in phrases)}
+
+For this anatomical region, identify which attributes apply:
+- Use ONLY these attributes: {', '.join(SG_ATTRIBUTES[:30])}  (showing first 30)
+- Return format: {{"attribute_name": value}}
+- Values: +1 (present), 0 (explicitly absent), -1 (uncertain/suspicious)
+
+Examples:
+- "normal in size" → {{"normal": 1, "enlarged": 0}}
+- "no pleural effusion" → {{"pleural effusion": 0}}
+- "suspicious for consolidation" → {{"consolidation": -1}}
+- "patchy opacities" → {{"opacity": 1, "patchy": 1}}
+
+Return ONLY a JSON object with attributes and values. No explanation.
+"""
         
         try:
             text = _call_llm_safe(prompt)
-            import json
-            # Extract JSON from response
-            m = re.search(r'(\{(?:.|\n)*\})', text)
-            if m:
-                json_text = m.group(1)
-            else:
-                json_text = text
+            print(f"[DEBUG] LLM response for {bbox_name}:")
+            print(f"  {text[:200]}...")
             
-            obj_findings = json.loads(json_text)
+            # Extract JSON more robustly
+            text = text.strip()
+            # Remove markdown code blocks
+            text = re.sub(r'```json\s*', '', text)
+            text = re.sub(r'```\s*', '', text)
             
-            # Ensure it's in the right format: {bbox_name: {attr: value}}
-            if bbox_name in obj_findings:
-                findings_dict[bbox_name] = obj_findings[bbox_name]
+            # Find JSON object
+            match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', text)
+            if match:
+                json_text = match.group(0)
+                attr_dict = json.loads(json_text)
+                
+                # Normalize keys to lowercase
+                attr_dict = {k.lower().strip(): v for k, v in attr_dict.items()}
+                
+                findings_dict[bbox_name] = attr_dict
+                print(f"  ✓ Extracted {len(attr_dict)} attributes")
             else:
-                findings_dict[bbox_name] = obj_findings
+                print(f"  ✗ No JSON found")
+                findings_dict[bbox_name] = {}
                 
         except Exception as e:
-            # On failure, create empty entry
+            print(f"  ✗ Error: {e}")
             findings_dict[bbox_name] = {}
     
+    print(f"[DEBUG] Enrichment complete: {len(findings_dict)} objects with findings")
     state["findings_dict"] = findings_dict
     return {"findings_dict": findings_dict}
 
 
 def llm_verifier_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Verify and normalize the extracted findings."""
+    """Verify findings - LIGHTWEIGHT VERSION."""
     findings = state.get("findings_dict", {})
     if not findings:
         return {"verified_findings": {}}
     
-    import json
-    prompt = VERIFICATION_PROMPT + "\n\n"
-    prompt += "Input findings JSON:\n"
-    prompt += json.dumps(findings, indent=2)
-    prompt += "\n\nOutput the verified and corrected JSON."
+    verified = {}
     
-    try:
-        text = _call_llm_safe(prompt)
-        m = re.search(r'(\{(?:.|\n)*\})', text)
-        if m:
-            json_text = m.group(1)
-        else:
-            json_text = text
-        verified = json.loads(json_text)
-    except Exception:
-        # Fallback to original findings
-        verified = findings
+    # Simple verification: ensure values are -1, 0, or 1
+    for obj_name, attr_dict in findings.items():
+        verified_attrs = {}
+        for attr, value in attr_dict.items():
+            try:
+                val = int(value)
+                if val in [-1, 0, 1]:
+                    verified_attrs[attr] = val
+                elif val > 0:
+                    verified_attrs[attr] = 1
+                elif val < 0:
+                    verified_attrs[attr] = -1
+            except:
+                pass
+        
+        if verified_attrs:
+            verified[obj_name] = verified_attrs
     
+    print(f"[DEBUG] Verified {len(verified)} objects")
     state["verified_findings"] = verified
     return {"verified_findings": verified}
 
 
 def matrix_builder_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Build the objects × attributes matrix from verified findings."""
+    """Build matrix with FLEXIBLE attribute matching."""
     findings: Dict[str, Dict[str, int]] = state.get("verified_findings", {})
     
-    # Initialize matrix with zeros (absent/not mentioned)
     matrix = np.zeros((NUM_OBJECTS, NUM_ATTRIBUTES), dtype=np.int8)
     
-    # Populate matrix based on findings
+    # Track what we matched
+    matched_count = 0
+    unmatched_attrs = []
+    
     for obj_name, attr_dict in findings.items():
         if obj_name not in OBJECT_TO_IDX:
+            print(f"[DEBUG] Unknown object: {obj_name}")
             continue
         
         obj_idx = OBJECT_TO_IDX[obj_name]
         
         for attr_name, value in attr_dict.items():
-            # Normalize attribute name (lowercase, strip)
-            attr_name_normalized = attr_name.lower().strip()
+            attr_name_clean = attr_name.lower().strip()
             
-            if attr_name_normalized not in ATTRIBUTE_TO_IDX:
-                # Try to find close match
-                for known_attr in SG_ATTRIBUTES:
-                    if known_attr in attr_name_normalized or attr_name_normalized in known_attr:
-                        attr_name_normalized = known_attr
-                        break
+            # Direct match
+            if attr_name_clean in ATTRIBUTE_TO_IDX:
+                attr_idx = ATTRIBUTE_TO_IDX[attr_name_clean]
+                matrix[obj_idx, attr_idx] = value
+                matched_count += 1
+                continue
             
-            if attr_name_normalized in ATTRIBUTE_TO_IDX:
-                attr_idx = ATTRIBUTE_TO_IDX[attr_name_normalized]
-                # Ensure value is -1, 0, or +1
-                if value in [-1, 0, 1]:
+            # Fuzzy match: check if attr_name contains any known attribute
+            matched = False
+            for known_attr in SG_ATTRIBUTES:
+                if known_attr in attr_name_clean or attr_name_clean in known_attr:
+                    attr_idx = ATTRIBUTE_TO_IDX[known_attr]
                     matrix[obj_idx, attr_idx] = value
+                    matched_count += 1
+                    matched = True
+                    break
+            
+            if not matched:
+                unmatched_attrs.append(attr_name_clean)
+    
+    print(f"[DEBUG] Matrix populated: {matched_count} cells")
+    print(f"[DEBUG] Non-zero entries: {np.count_nonzero(matrix)}")
+    if unmatched_attrs:
+        print(f"[DEBUG] Unmatched attributes: {set(unmatched_attrs)}")
     
     state["scene_graph_matrix"] = matrix
     return {"scene_graph_matrix": matrix}
 
 
 def aggregator_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Final aggregation - prepare matrix and metadata for output."""
+    """Final aggregation."""
     matrix = state.get("scene_graph_matrix")
     findings = state.get("verified_findings", {})
     
     if matrix is None:
         matrix = np.zeros((NUM_OBJECTS, NUM_ATTRIBUTES), dtype=np.int8)
     
-    # Create metadata for easy interpretation
     metadata = {
         "objects": SG_OBJECTS,
         "attributes": SG_ATTRIBUTES,
@@ -222,8 +290,18 @@ def aggregator_node(state: Dict[str, Any]) -> Dict[str, Any]:
             "0": "absent/not mentioned",
             "-1": "uncertain"
         },
-        "findings_summary": findings
+        "findings_summary": findings,
+        "statistics": {
+            "total_cells": int(matrix.size),
+            "positive": int(np.sum(matrix == 1)),
+            "negative": int(np.sum(matrix == 0)),
+            "uncertain": int(np.sum(matrix == -1)),
+            "coverage": float(np.sum(matrix != 0) / matrix.size * 100)
+        }
     }
+    
+    print(f"[DEBUG] Final matrix shape: {matrix.shape}")
+    print(f"[DEBUG] Statistics: {metadata['statistics']}")
     
     state["final_matrix"] = matrix
     state["metadata"] = metadata
