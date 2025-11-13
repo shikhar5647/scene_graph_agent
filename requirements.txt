@@ -1,5 +1,7 @@
 streamlit
-google-genai       # Google GenAI SDK (Gemini) - quickstart uses `google-genai`
-langgraph        # LangGraph orchestration
+google-genai       # Google GenAI SDK (Gemini)
+langgraph          # LangGraph orchestration
 python-dotenv
 regex
+numpy              # For matrix operations
+pandas             # For DataFrame display in Streamlit
