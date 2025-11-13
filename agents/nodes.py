@@ -1,11 +1,16 @@
 # agents/nodes.py
 import re
 import os
+import numpy as np
 from typing import Dict, Any, List
 from dotenv import load_dotenv
 from google import genai
-from utils.config import SG_OBJECTS
-from utils.prompts import BASE_ENRICH_PROMPT
+from utils.config import (
+    SG_OBJECTS, SG_ATTRIBUTES, 
+    OBJECT_TO_IDX, ATTRIBUTE_TO_IDX,
+    NUM_OBJECTS, NUM_ATTRIBUTES
+)
+from utils.prompts import BASE_ENRICH_PROMPT, VERIFICATION_PROMPT
 
 # Load environment variables from .env file
 load_dotenv()
@@ -18,16 +23,11 @@ client = genai.Client(api_key=api_key)
 
 
 def _call_llm_safe(prompt: str) -> str:
-    """Call the configured genai client with a variety of possible method names.
-
-    Different versions of the Google GenAI SDK expose different client APIs. This
-    helper tries several call patterns and returns the textual content.
-    """
+    """Call the configured genai client with a variety of possible method names."""
     # 1) direct generate_content on client
     try:
         if hasattr(client, "generate_content"):
             resp = client.generate_content(prompt)
-            # resp may be object with .text or a plain string
             return getattr(resp, "text", str(resp))
     except Exception:
         pass
@@ -36,7 +36,7 @@ def _call_llm_safe(prompt: str) -> str:
     try:
         models = getattr(client, "models", None)
         if models and hasattr(models, "generate_content"):
-            resp = models.generate_content(model="gemini-2.5-pro", contents=prompt)
+            resp = models.generate_content(model="gemini-2.0-flash-exp", contents=prompt)
             return getattr(resp, "text", str(resp))
     except Exception:
         pass
@@ -60,119 +60,175 @@ def _call_llm_safe(prompt: str) -> str:
         raise RuntimeError("No compatible genai client method found or call failed: " + str(e))
 
 
-# Simple sentence splitter - keeps sentence boundaries naive but robust for typical reports
 def split_report_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Split report into sentences."""
     report: str = state.get("report_text", "").strip()
     if not report:
         return {"error": "no report_text provided"}
-    # naive splitting by newline and punctuation (radiology reports often line-break per sentence)
+    
     sentences = []
     for line in report.splitlines():
         line = line.strip()
         if not line:
             continue
-        # split on sentence-ending punctuation but keep short fragments
         parts = re.split(r'(?<=[\.\?!])\s+', line)
         for p in parts:
             p = p.strip()
             if p:
                 sentences.append(p)
+    
     state["sentences"] = sentences
     return {"sentences": sentences}
 
-# rule-based object matcher: attempt to map sentences to candidate objects using simple substring match
+
 def candidate_extractor_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract candidate object mentions from sentences."""
     sentences: List[str] = state.get("sentences", [])
     candidate_map = {o: [] for o in SG_OBJECTS}
     lowered_objs = [(o, o.lower()) for o in SG_OBJECTS]
+    
     for s in sentences:
         s_low = s.lower()
-        matched = False
         for obj, obj_low in lowered_objs:
-            # exact substring match or split-word match
             if obj_low in s_low:
                 candidate_map[obj].append(s)
-                matched = True
-        # fallback heuristics: look for 'left', 'right' + zone words or common terms
-        # (this is purposely simple — main disambiguation is done by LLM later)
-    # prune empty lists
+    
+    # Keep only objects with associated sentences
     candidate_map = {k: v for k, v in candidate_map.items() if v}
     state["candidates"] = candidate_map
     return {"candidates": candidate_map}
 
-# LLM enrichment node: calls Gemini 2.5 Pro to convert candidate sentences -> structured attributes (Chest-ImaGenome style)
+
 def llm_enricher_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Use LLM to extract attributes for each object mention."""
     candidates: Dict[str, List[str]] = state.get("candidates", {})
     if not candidates:
-        return {"scene_graph": {}}
-    # We'll craft a prompt that injects the exact sentences
-    # For reliability, handle each object independently (smaller prompts)
-    scene_graph = {}
+        return {"findings_dict": {}}
+    
+    findings_dict = {}
+    
     for bbox_name, phrases in candidates.items():
         prompt = BASE_ENRICH_PROMPT + "\n\n"
-        prompt += f"Target object: {bbox_name}\n\n"
-        prompt += "Report sentences associated:\n"
+        prompt += f"Target anatomical object: {bbox_name}\n\n"
+        prompt += "Report sentences mentioning this object:\n"
         for p in phrases:
             prompt += f"- {p}\n"
-        prompt += "\nProduce a JSON object for this single bounding object with fields: bbox_name, attributes (list of lists), phrases (list). Output only the JSON for the object.\n"
-        # call Gemini Pro
+        prompt += "\nExtract attributes and their status (+1, 0, or -1) for this object. Output only JSON.\n"
+        
         try:
             text = _call_llm_safe(prompt)
-            # The model should return JSON; attempt to parse it conservatively
             import json
-            # try to extract the first JSON block
+            # Extract JSON from response
             m = re.search(r'(\{(?:.|\n)*\})', text)
             if m:
                 json_text = m.group(1)
             else:
                 json_text = text
-            obj_dict = json.loads(json_text)
-            # Basic normalization: ensure bbox_name matches
-            obj_dict["bbox_name"] = bbox_name
-            obj_dict.setdefault("phrases", phrases)
-            scene_graph[bbox_name] = obj_dict
+            
+            obj_findings = json.loads(json_text)
+            
+            # Ensure it's in the right format: {bbox_name: {attr: value}}
+            if bbox_name in obj_findings:
+                findings_dict[bbox_name] = obj_findings[bbox_name]
+            else:
+                findings_dict[bbox_name] = obj_findings
+                
         except Exception as e:
-            # On failure, fallback to a minimal entry
-            scene_graph[bbox_name] = {
-                "bbox_name": bbox_name,
-                "attributes": [],
-                "phrases": phrases
-            }
-    state["scene_graph_partial"] = scene_graph
-    return {"scene_graph_partial": scene_graph}
+            # On failure, create empty entry
+            findings_dict[bbox_name] = {}
+    
+    state["findings_dict"] = findings_dict
+    return {"findings_dict": findings_dict}
 
-# verifier node: ask Gemini to verify and normalize the scene graph JSON (single consolidated pass)
+
 def llm_verifier_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    partial = state.get("scene_graph_partial", {})
-    if not partial:
-        return {"scene_graph": {}}
+    """Verify and normalize the extracted findings."""
+    findings = state.get("findings_dict", {})
+    if not findings:
+        return {"verified_findings": {}}
+    
     import json
-    prompt = (
-        "You are an assistant that receives a partial Chest-ImaGenome-style scene graph (JSON). "
-        "Validate the JSON, normalize attribute labels (lowercase, short phrases), and remove obviously contradictory entries. "
-        "Return the final scene_graph JSON mapping bbox_name -> object-dictionary. Only output JSON.\n\n"
-        "Input JSON:\n"
-        + json.dumps(partial, indent=2) +
-        "\n\nOutput the corrected JSON."
-    )
+    prompt = VERIFICATION_PROMPT + "\n\n"
+    prompt += "Input findings JSON:\n"
+    prompt += json.dumps(findings, indent=2)
+    prompt += "\n\nOutput the verified and corrected JSON."
+    
     try:
         text = _call_llm_safe(prompt)
-        import re, json
         m = re.search(r'(\{(?:.|\n)*\})', text)
         if m:
             json_text = m.group(1)
         else:
             json_text = text
-        final = json.loads(json_text)
-    except Exception as e:
-        # fallback to original partial
-        final = partial
-    state["scene_graph"] = final
-    return {"scene_graph": final}
+        verified = json.loads(json_text)
+    except Exception:
+        # Fallback to original findings
+        verified = findings
+    
+    state["verified_findings"] = verified
+    return {"verified_findings": verified}
 
-# aggregator node: final formatting (if needed)
+
+def matrix_builder_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Build the objects × attributes matrix from verified findings."""
+    findings: Dict[str, Dict[str, int]] = state.get("verified_findings", {})
+    
+    # Initialize matrix with zeros (absent/not mentioned)
+    matrix = np.zeros((NUM_OBJECTS, NUM_ATTRIBUTES), dtype=np.int8)
+    
+    # Populate matrix based on findings
+    for obj_name, attr_dict in findings.items():
+        if obj_name not in OBJECT_TO_IDX:
+            continue
+        
+        obj_idx = OBJECT_TO_IDX[obj_name]
+        
+        for attr_name, value in attr_dict.items():
+            # Normalize attribute name (lowercase, strip)
+            attr_name_normalized = attr_name.lower().strip()
+            
+            if attr_name_normalized not in ATTRIBUTE_TO_IDX:
+                # Try to find close match
+                for known_attr in SG_ATTRIBUTES:
+                    if known_attr in attr_name_normalized or attr_name_normalized in known_attr:
+                        attr_name_normalized = known_attr
+                        break
+            
+            if attr_name_normalized in ATTRIBUTE_TO_IDX:
+                attr_idx = ATTRIBUTE_TO_IDX[attr_name_normalized]
+                # Ensure value is -1, 0, or +1
+                if value in [-1, 0, 1]:
+                    matrix[obj_idx, attr_idx] = value
+    
+    state["scene_graph_matrix"] = matrix
+    return {"scene_graph_matrix": matrix}
+
+
 def aggregator_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    sg = state.get("scene_graph", {})
-    # ensure top-level mapping format similar to Chest ImaGenome: each value contains attributes, phrases, etc.
-    # (we assume verifier returned that)
-    return {"scene_graph": sg}
+    """Final aggregation - prepare matrix and metadata for output."""
+    matrix = state.get("scene_graph_matrix")
+    findings = state.get("verified_findings", {})
+    
+    if matrix is None:
+        matrix = np.zeros((NUM_OBJECTS, NUM_ATTRIBUTES), dtype=np.int8)
+    
+    # Create metadata for easy interpretation
+    metadata = {
+        "objects": SG_OBJECTS,
+        "attributes": SG_ATTRIBUTES,
+        "matrix_shape": matrix.shape,
+        "value_legend": {
+            "+1": "present",
+            "0": "absent/not mentioned",
+            "-1": "uncertain"
+        },
+        "findings_summary": findings
+    }
+    
+    state["final_matrix"] = matrix
+    state["metadata"] = metadata
+    
+    return {
+        "final_matrix": matrix,
+        "metadata": metadata
+    }
