@@ -1,32 +1,32 @@
 # agents/graph.py
 from typing import TypedDict, Optional, Dict, Any
+import numpy as np
 from agents.nodes import (
     split_report_node,
     candidate_extractor_node,
     llm_enricher_node,
     llm_verifier_node,
+    matrix_builder_node,
     aggregator_node,
 )
 
-# a minimal state typed dict (can be richer)
+# State definition for the pipeline
 class ReportState(TypedDict):
     report_text: str
     sentences: Optional[list[str]]
     candidates: Optional[dict]
-    scene_graph_partial: Optional[dict]
-    scene_graph: Optional[dict]
+    findings_dict: Optional[dict]
+    verified_findings: Optional[dict]
+    scene_graph_matrix: Optional[np.ndarray]
+    final_matrix: Optional[np.ndarray]
+    metadata: Optional[dict]
 
 
 def _run_nodes_sequential(report_text: str) -> Dict[str, Any]:
-    """Fallback runner that executes the nodes sequentially without langgraph.
-
-    This is used when the installed langgraph API is incompatible or if
-    the StateGraph approach raises errors (for example, unknown-node edges).
-    It mirrors the same pipeline order used previously.
-    """
+    """Fallback runner that executes the nodes sequentially without langgraph."""
     state: Dict[str, Any] = {"report_text": report_text}
 
-    # 1. Split
+    # 1. Split sentences
     out = split_report_node(state)
     state.update(out)
 
@@ -38,44 +38,58 @@ def _run_nodes_sequential(report_text: str) -> Dict[str, Any]:
     out = llm_enricher_node(state)
     state.update(out)
 
-    # 4. LLM verification/normalization
+    # 4. LLM verification
     out = llm_verifier_node(state)
     state.update(out)
 
-    # 5. Aggregation
+    # 5. Matrix building
+    out = matrix_builder_node(state)
+    state.update(out)
+
+    # 6. Aggregation
     out = aggregator_node(state)
     state.update(out)
 
-    return state.get("scene_graph", {})
+    return {
+        "matrix": state.get("final_matrix"),
+        "metadata": state.get("metadata")
+    }
 
 
-def run_graph(report_text: str):
-    """Attempt to build and run a langgraph StateGraph if available, otherwise
-    fall back to a simple sequential runner.
-    """
+def run_graph(report_text: str) -> Dict[str, Any]:
+    """Run the scene graph extraction pipeline and return matrix + metadata."""
     try:
-        # try to import StateGraph lazily (may fail on incompatible langgraph)
         from langgraph.graph import StateGraph, START, END
 
         graph = StateGraph(ReportState)
-        # add nodes (functions)
+        
+        # Add nodes
         graph.add_node(split_report_node, name="split_report")
         graph.add_node(candidate_extractor_node, name="candidate_extractor")
         graph.add_node(llm_enricher_node, name="llm_enricher")
         graph.add_node(llm_verifier_node, name="llm_verifier")
+        graph.add_node(matrix_builder_node, name="matrix_builder")
         graph.add_node(aggregator_node, name="aggregator")
-        # edges / flow
+        
+        # Define edges
         graph.add_edge(START, "split_report")
         graph.add_edge("split_report", "candidate_extractor")
         graph.add_edge("candidate_extractor", "llm_enricher")
         graph.add_edge("llm_enricher", "llm_verifier")
-        graph.add_edge("llm_verifier", "aggregator")
+        graph.add_edge("llm_verifier", "matrix_builder")
+        graph.add_edge("matrix_builder", "aggregator")
         graph.add_edge("aggregator", END)
+        
         graph = graph.compile()
         initial_state = {"report_text": report_text}
         result = graph.invoke(initial_state)
+        
         final_state = getattr(result, "state", result)
-        return final_state.get("scene_graph", {})
+        return {
+            "matrix": final_state.get("final_matrix"),
+            "metadata": final_state.get("metadata")
+        }
+        
     except Exception:
-        # Any failure in building/running the StateGraph falls back to sequential
+        # Fallback to sequential execution
         return _run_nodes_sequential(report_text)
