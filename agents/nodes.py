@@ -4,6 +4,7 @@ import os
 import json
 import numpy as np
 from typing import Dict, Any, List, Set
+from utils.prompts import (    BASE_ENRICH_PROMPT, VERIFICATION_PROMPT)
 from dotenv import load_dotenv
 from utils.config import (
     SG_OBJECTS, SG_ATTRIBUTES, ATTRIBUTE_CATEGORIES,
@@ -42,7 +43,7 @@ def _call_llm_safe(prompt: str) -> str:
             return getattr(resp, "text", str(resp))
         models = getattr(client, "models", None)
         if models and hasattr(models, "generate_content"):
-            resp = models.generate_content(model="gemini-2.0-flash-exp", contents=prompt)
+            resp = models.generate_content(model="gemini-2.5-pro", contents=prompt)
             return getattr(resp, "text", str(resp))
     except Exception:
         pass

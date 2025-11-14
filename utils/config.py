@@ -250,7 +250,7 @@ IDX_TO_ATTRIBUTE = {idx: attr for idx, attr in enumerate(SG_ATTRIBUTES)}
 
 # Matrix dimensions
 NUM_OBJECTS = len(SG_OBJECTS)  # 29
-NUM_ATTRIBUTES = len(SG_ATTRIBUTES)  # ~180
+NUM_ATTRIBUTES = len(SG_ATTRIBUTES)  # 180
 
 # For reference: Category IDs used in SGRRG
 CATEGORY_IDS = [
