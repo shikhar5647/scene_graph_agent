@@ -97,7 +97,7 @@ if 'result' in st.session_state:
     with col4:
         st.metric("Uncertain (-1)", stats['uncertain'])
     with col5:
-        st.metric("Coverage", f"{stats['coverage']:.1f}%")
+        st.metric("Coverage", f"{stats['known_coverage']:.1f}%")
     
     # Tabs
     tab1, tab2, tab3, tab4, tab5 = st.tabs([
