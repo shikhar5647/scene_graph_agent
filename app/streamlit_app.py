@@ -155,7 +155,9 @@ if 'result' in st.session_state:
             elif val == -1:
                 return 'background-color: #fff3cd; color: #856404; font-weight: bold'
             elif val == 0:
-                return 'background-color: #f8d7da; color: #721c24'
+                return 'background-color: #f8d7da; color: #721c24; font-weight: bold'
+            elif val == -2:
+                return 'background-color: #f8f9fa; color: #6c757d'
             return ''
         
         if not df.empty:
