@@ -402,8 +402,19 @@ Return the corrected findings in the SAME JSON format. Output ONLY JSON:"""
             response = re.sub(r'```(?:json)?', '', response).strip()
             match = re.search(r'\{[^{}]*(?:\{[^{}]*\})*[^{}]*\}', response, re.DOTALL)
             if match:
-                verified = json.loads(match.group(0))
-                print(f"[VERIFY] ✓ Validated findings")
+                raw_verified = json.loads(match.group(0))
+                
+                # --- START FIX: Normalize keys from verifier LLM ---
+                verified = {}
+                for obj_name, attrs in raw_verified.items():
+                    clean_obj = obj_name.lower().strip()
+                    if clean_obj not in verified:
+                        verified[clean_obj] = {}
+                    for attr_name, val in attrs.items():
+                        clean_attr = attr_name.lower().strip()
+                        if val in [-1, 0, 1]:
+                            verified[clean_obj][clean_attr] = int(val)
+                print(f"[VERIFY] ✓ Validated and normalized findings")
                 state["verified_findings"] = verified
                 return {"verified_findings": verified}
     except Exception as e:

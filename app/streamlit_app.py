@@ -91,9 +91,9 @@ if 'result' in st.session_state:
     with col1:
         st.metric("Matrix Size", f"{matrix.shape[0]}×{matrix.shape[1]}")
     with col2:
-        st.metric("Present (+1)", stats['positive'])
+        st.metric("Present (+1)", stats['present'])
     with col3:
-        st.metric("Absent (0)", stats['negative'])
+        st.metric("Absent (0)", stats['absent'])
     with col4:
         st.metric("Uncertain (-1)", stats['uncertain'])
     with col5:
