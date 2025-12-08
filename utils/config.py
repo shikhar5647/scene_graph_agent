@@ -43,7 +43,6 @@ ANATOMICAL_FINDINGS = [
     "unremarkable",
     "hyperinflated",
     "hyperlucent",
-    "low lung volumes",
     "elevated",
     "flattened",
     "displaced",
