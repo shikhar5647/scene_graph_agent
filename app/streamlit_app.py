@@ -22,8 +22,9 @@ Generate a **29 objects × 180 attributes** scene graph matrix from chest X-ray 
 
 **Matrix Values:**
 - **+1** = Attribute present
-- **0** = Attribute explicitly absent  
 - **-1** = Attribute uncertain (suspicious/possible)
+- **-2** = Attribute explicitly absent (negated in text)
+- **0** = Attribute not mentioned (sparse default)
 """)
 
 # Sidebar info
@@ -93,7 +94,7 @@ if 'result' in st.session_state:
     with col2:
         st.metric("Present (+1)", stats['present'])
     with col3:
-        st.metric("Absent (0)", stats['absent'])
+        st.metric("Explicitly absent (-2)", stats.get('explicitly_absent', 0))
     with col4:
         st.metric("Uncertain (-1)", stats['uncertain'])
     with col5:
@@ -122,7 +123,7 @@ if 'result' in st.session_state:
             filter_category = st.selectbox("Filter by attribute category", 
                                           ["All"] + list(set(metadata['attribute_categories'].values())))
         with col3:
-            value_filter = st.selectbox("Filter by value", ["All", "Present (+1)", "Absent (0)", "Uncertain (-1)"])
+            value_filter = st.selectbox("Filter by value", ["All", "Present (+1)", "Uncertain (-1)", "Explicitly absent (-2)", "Not mentioned (0)"])
         
         # Build filtered dataframe
         df = pd.DataFrame(matrix, index=objects, columns=attributes)
@@ -140,7 +141,12 @@ if 'result' in st.session_state:
         
         # Filter by value
         if value_filter != "All":
-            val_map = {"Present (+1)": 1, "Absent (0)": 0, "Uncertain (-1)": -1}
+            val_map = {
+                "Present (+1)": 1,
+                "Uncertain (-1)": -1,
+                "Explicitly absent (-2)": -2,
+                "Not mentioned (0)": 0,
+            }
             target_val = val_map[value_filter]
             cols_with_val = (df == target_val).any(axis=0)
             df = df.loc[:, cols_with_val]
@@ -154,9 +160,9 @@ if 'result' in st.session_state:
                 return 'background-color: #d4edda; color: #155724; font-weight: bold'
             elif val == -1:
                 return 'background-color: #fff3cd; color: #856404; font-weight: bold'
-            elif val == 0:
-                return 'background-color: #f8d7da; color: #721c24; font-weight: bold'
             elif val == -2:
+                return 'background-color: #f8d7da; color: #721c24; font-weight: bold'
+            elif val == 0:
                 return 'background-color: #f8f9fa; color: #6c757d'
             return ''
         
@@ -191,8 +197,8 @@ if 'result' in st.session_state:
                         if cat not in by_category:
                             by_category[cat] = []
                         
-                        symbol = {1: "✓", 0: "✗", -1: "⚠"}.get(val, "?")
-                        color = {1: "green", 0: "red", -1: "orange"}.get(val, "gray")
+                        symbol = {1: "✓", -2: "✗", -1: "⚠", 0: ""}.get(val, "?")
+                        color = {1: "green", -2: "red", -1: "orange", 0: "gray"}.get(val, "gray")
                         by_category[cat].append((symbol, attr, val, color))
                     
                     # Display by category
@@ -230,10 +236,10 @@ if 'result' in st.session_state:
                 findings_list = category_findings[cat]
                 
                 # Group by value
-                for val in [1, -1, 0]:
+                for val in [1, -1, -2, 0]:
                     items = [(o, a) for o, a, v in findings_list if v == val]
                     if items:
-                        val_label = {1: "✓ Present", -1: "⚠ Uncertain", 0: "✗ Absent"}[val]
+                        val_label = {1: "✓ Present", -1: "⚠ Uncertain", -2: "✗ Explicitly absent", 0: "Not mentioned"}[val]
                         st.markdown(f"**{val_label}** ({len(items)})")
                         for obj, attr in items:
                             st.markdown(f"- {obj}: {attr}")

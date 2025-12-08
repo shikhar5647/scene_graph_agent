@@ -68,7 +68,7 @@ def _call_llm_safe(prompt: str) -> str:
 def extract_findings_rule_based(text: str, object_name: str) -> Dict[str, int]:
     """
     Rule-based extraction returning {attribute: value}.
-    Values: 1 (present), 0 (explicitly absent), -1 (uncertain), -2 (not mentioned)
+    Values: 1 (present), -2 (explicitly absent), -1 (uncertain), 0 (not mentioned)
     """
     text_lower = text.lower()
     findings = {}
@@ -147,7 +147,7 @@ def extract_findings_rule_based(text: str, object_name: str) -> Dict[str, int]:
         if attr not in findings:
             for pattern in patterns:
                 if re.search(pattern, text_lower):
-                    findings[attr] = 0
+                    findings[attr] = -2
                     break
     
     # Extract positive
@@ -202,10 +202,10 @@ INSTRUCTIONS:
 1. Analyze the report text for findings related to {object_name}
 2. Return ONLY attributes that are EXPLICITLY mentioned or clearly implied
 3. Use these values:
-   - 1 = Definitely present (e.g., "opacity", "cardiomegaly")
-   - 0 = Explicitly absent (e.g., "no effusion", "no consolidation")
-   - -1 = Uncertain (e.g., "suspicious for", "possible", "may represent")
-   - DO NOT include -2 (that's for attributes not mentioned at all)
+    - 1 = Definitely present (e.g., "opacity", "cardiomegaly")
+    - -2 = Explicitly absent (e.g., "no effusion", "no consolidation")
+    - -1 = Uncertain (e.g., "suspicious for", "possible", "may represent")
+    - DO NOT include 0 (0 will be used to mark attributes not mentioned at all)
 
 4. Common attributes to consider: {attr_list}
 
@@ -240,7 +240,7 @@ Return ONLY the JSON object:"""
             normalized = {}
             for key, val in llm_findings.items():
                 key_clean = key.lower().strip()
-                if isinstance(val, (int, float)) and val in [-1, 0, 1]:
+                if isinstance(val, (int, float)) and val in [-1, -2, 1]:
                     normalized[key_clean] = int(val)
             
             print(f"[LLM] Extracted {len(normalized)} findings")
@@ -375,7 +375,7 @@ def llm_verifier_node(state: Dict[str, Any]) -> Dict[str, Any]:
         # Just validate values
         verified = {}
         for obj, attrs in findings.items():
-            verified[obj] = {k: v for k, v in attrs.items() if v in [-1, 0, 1]}
+            verified[obj] = {k: v for k, v in attrs.items() if v in [-1, -2, 1]}
         state["verified_findings"] = verified
         return {"verified_findings": verified}
     
@@ -389,10 +389,9 @@ EXTRACTED FINDINGS:
 
 VALIDATION RULES:
 1. Check logical consistency (e.g., can't have "normal" AND "cardiomegaly" both as 1)
-2. Verify negations are correct (0 = explicitly absent)
-3. Check uncertainty markers (-1 = suspicious/possible)
 4. Remove contradictions
-5. Values must be: 1 (present), 0 (absent), -1 (uncertain)
+2. Verify negations are correct (-2 = explicitly absent)
+3. Check uncertainty markers (-1 = suspicious/possible)
 
 Return the corrected findings in the SAME JSON format. Output ONLY JSON:"""
     
@@ -412,7 +411,7 @@ Return the corrected findings in the SAME JSON format. Output ONLY JSON:"""
                         verified[clean_obj] = {}
                     for attr_name, val in attrs.items():
                         clean_attr = attr_name.lower().strip()
-                        if val in [-1, 0, 1]:
+                        if val in [-1, -2, 1]:
                             verified[clean_obj][clean_attr] = int(val)
                 print(f"[VERIFY] ✓ Validated and normalized findings")
                 state["verified_findings"] = verified
@@ -423,7 +422,7 @@ Return the corrected findings in the SAME JSON format. Output ONLY JSON:"""
     # Fallback: basic validation
     verified = {}
     for obj, attrs in findings.items():
-        verified[obj] = {k: v for k, v in attrs.items() if v in [-1, 0, 1]}
+        verified[obj] = {k: v for k, v in attrs.items() if v in [-1, -2, 1]}
     
     state["verified_findings"] = verified
     return {"verified_findings": verified}
@@ -431,12 +430,12 @@ Return the corrected findings in the SAME JSON format. Output ONLY JSON:"""
 
 def matrix_builder_node(state: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Build matrix with 4 values: -2 (unknown), -1 (uncertain), 0 (absent), 1 (present).
+    Build matrix with values: 0 (not mentioned), -2 (explicitly absent), -1 (uncertain), 1 (present).
     """
     findings = state.get("verified_findings", {})
     
-    # Initialize with -2 (unknown/not mentioned)
-    matrix = np.full((NUM_OBJECTS, NUM_ATTRIBUTES), -2, dtype=np.int8)
+    # Initialize with 0 (not mentioned)
+    matrix = np.full((NUM_OBJECTS, NUM_ATTRIBUTES), 0, dtype=np.int8)
     
     print(f"\n[MATRIX] Building {NUM_OBJECTS}×{NUM_ATTRIBUTES}...")
     
@@ -453,10 +452,10 @@ def matrix_builder_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 matrix[obj_idx, attr_idx] = value
                 matched += 1
     
-    non_unknown = np.sum(matrix != -2)
-    print(f"[MATRIX] Populated {matched} cells")
-    print(f"[MATRIX] Values: {np.sum(matrix == 1)} present, {np.sum(matrix == 0)} absent, "
-          f"{np.sum(matrix == -1)} uncertain, {np.sum(matrix == -2)} unknown")
+        non_unknown = np.sum(matrix != 0)
+        print(f"[MATRIX] Populated {matched} cells")
+        print(f"[MATRIX] Values: {np.sum(matrix == 1)} present, {np.sum(matrix == -2)} explicitly absent, "
+            f"{np.sum(matrix == -1)} uncertain, {np.sum(matrix == 0)} not mentioned")
     
     state["scene_graph_matrix"] = matrix
     return {"scene_graph_matrix": matrix}
@@ -468,7 +467,7 @@ def aggregator_node(state: Dict[str, Any]) -> Dict[str, Any]:
     findings = state.get("verified_findings", {})
     
     if matrix is None:
-        matrix = np.full((NUM_OBJECTS, NUM_ATTRIBUTES), -2, dtype=np.int8)
+        matrix = np.full((NUM_OBJECTS, NUM_ATTRIBUTES), 0, dtype=np.int8)
     
     metadata = {
         "objects": SG_OBJECTS,
@@ -477,26 +476,26 @@ def aggregator_node(state: Dict[str, Any]) -> Dict[str, Any]:
         "matrix_shape": list(matrix.shape),
         "value_legend": {
             "1": "present",
-            "0": "explicitly absent",
+            "0": "not mentioned",
             "-1": "uncertain",
-            "-2": "unknown/not mentioned"
+            "-2": "explicitly absent"
         },
         "findings_summary": findings,
         "statistics": {
             "total_cells": int(matrix.size),
             "present": int(np.sum(matrix == 1)),
-            "absent": int(np.sum(matrix == 0)),
+            "explicitly_absent": int(np.sum(matrix == -2)),
             "uncertain": int(np.sum(matrix == -1)),
-            "unknown": int(np.sum(matrix == -2)),
-            "known_coverage": float(np.sum(matrix != -2) / matrix.size * 100)
+            "not_mentioned": int(np.sum(matrix == 0)),
+            "known_coverage": float(np.sum(matrix != 0) / matrix.size * 100)
         }
     }
     
     print(f"\n[FINAL] Matrix complete:")
     print(f"  +1 (present): {metadata['statistics']['present']}")
-    print(f"  0 (absent): {metadata['statistics']['absent']}")
+    print(f"  -2 (explicitly absent): {metadata['statistics']['explicitly_absent']}")
     print(f"  -1 (uncertain): {metadata['statistics']['uncertain']}")
-    print(f"  -2 (unknown): {metadata['statistics']['unknown']}")
+    print(f"  0 (not mentioned): {metadata['statistics']['not_mentioned']}")
     print(f"  Known coverage: {metadata['statistics']['known_coverage']:.2f}%")
     
     state["final_matrix"] = matrix
