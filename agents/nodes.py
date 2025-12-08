@@ -3,7 +3,7 @@ import re
 import os
 import json
 import numpy as np
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 from dotenv import load_dotenv
 from utils.config import (
     SG_OBJECTS, SG_ATTRIBUTES, ATTRIBUTE_CATEGORIES,
@@ -71,106 +71,93 @@ def extract_findings_rule_based(text: str, object_name: str) -> Dict[str, int]:
     Values: 1 (present), -2 (explicitly absent), -1 (uncertain), 0 (not mentioned)
     """
     text_lower = text.lower()
-    findings = {}
-    
-    # POSITIVE patterns
-    positive_patterns = {
+    findings: Dict[str, int] = {}
+
+    # Helper: detect negation/uncertainty around a match span
+    def _negation_or_uncertain(ctx: str) -> Tuple[bool, bool]:
+        # Returns (is_negated, is_uncertain)
+        negation_tokens = [r'no', r'without', r'free of', r'clear of', r'not present', r'absent']
+        uncertain_tokens = [r'possible', r'possibly', r'may represent', r'may be', r'suspicious for', r'concerning for', r'suggestive of']
+        # Check within a window of up to 120 chars before the match
+        window = ctx[-120:]
+        for nt in negation_tokens:
+            if re.search(rf"\b{nt}\b", window):
+                return True, False
+        for ut in uncertain_tokens:
+            if re.search(rf"{ut}", window):
+                return False, True
+        return False, False
+
+    # Build patterns for each known attribute (prefer SG_ATTRIBUTES canonical list)
+    for attr in SG_ATTRIBUTES:
+        attr_key = attr.lower().strip()
+        # create a permissive regex for attribute (spaces -> \s+)
+        pattern = re.escape(attr_key)
+        pattern = pattern.replace(r'\ ', r'\s+')
+        # Search all occurrences to capture negation context
+        for m in re.finditer(rf'\b({pattern})\b', text_lower):
+            span_start = max(0, m.start() - 120)
+            ctx = text_lower[span_start:m.end()]
+            is_neg, is_unc = _negation_or_uncertain(ctx)
+            if is_unc:
+                findings[attr_key] = -1
+            elif is_neg:
+                findings[attr_key] = -2
+            else:
+                findings[attr_key] = 1
+
+    # Some additional heuristic patterns to capture common words not in SG_ATTRIBUTES
+    heuristics = {
         'normal': [r'\bnormal\b', r'unremarkable', r'within normal limits'],
         'clear': [r'\bclear\b', r'well aerated'],
-        'hyperinflated': [r'hyperinflat'],
-        'elevated': [r'elevated', r'elevation'],
-        'flattened': [r'flattened'],
-        'displaced': [r'displaced'],
-        'enlarged': [r'enlarged', r'enlargement'],
-        'tortuous': [r'tortuous'],
         'opacity': [r'opacit(?:y|ies)', r'densit(?:y|ies)'],
         'consolidation': [r'consolidation', r'consolidate'],
         'infiltrate': [r'infiltrat'],
-        'atelectasis': [r'atelectasis'],
-        'collapse': [r'\bcollapse\b', r'collapsed'],
         'pleural effusion': [r'pleural\s+effusion', r'\beffusion\b'],
         'pneumothorax': [r'pneumothorax'],
-        'pulmonary edema': [r'pulmonary\s+edema', r'\bedema\b'],
         'cardiomegaly': [r'cardiomegaly', r'cardiac\s+enlargement'],
-        'mass': [r'\bmass\b'],
-        'nodule': [r'nodule'],
-        'calcification': [r'calcification', r'calcified'],
-        'fibrosis': [r'fibrosis'],
-        'scarring': [r'scar(?:ring)?'],
-        'thickening': [r'thickening'],
-        'pneumonia': [r'pneumonia'],
-        'infection': [r'infection', r'infectious'],
-        'fracture': [r'fracture'],
-        'focal': [r'\bfocal\b'],
-        'diffuse': [r'diffuse'],
-        'patchy': [r'patchy'],
-        'bilateral': [r'bilateral', r'\bboth\b'],
-        'mild': [r'\bmild\b'],
-        'moderate': [r'moderate'],
-        'severe': [r'severe'],
-        'acute': [r'\bacute\b'],
-        'chronic': [r'chronic'],
+        'atelectasis': [r'atelectasis'],
     }
-    
-    # NEGATIVE patterns (explicitly absent)
-    negative_patterns = {
-        'opacity': [r'no\s+opacit', r'clear\s+of\s+opacit'],
-        'consolidation': [r'no\s+consolidation', r'clear\s+of\s+consolidation'],
-        'pleural effusion': [r'no\s+(?:pleural\s+)?effusion'],
-        'pneumothorax': [r'no\s+pneumothorax'],
-        'cardiomegaly': [r'no\s+cardiomegaly', r'normal\s+cardiac\s+size'],
-        'enlarged': [r'not\s+enlarged', r'normal\s+(?:in\s+)?size'],
-        'atelectasis': [r'no\s+atelectasis'],
-        'pulmonary edema': [r'no\s+(?:pulmonary\s+)?edema'],
-        'acute': [r'no\s+acute'],
-        'fracture': [r'no\s+fracture'],
-    }
-    
-    # UNCERTAIN patterns
-    uncertain_patterns = {
-        'consolidation': [r'suspicious\s+for.*consolidation', r'possible.*consolidation'],
-        'opacity': [r'suspicious\s+for.*opacit', r'possible.*opacit'],
-        'pneumonia': [r'suspicious\s+for.*pneumonia', r'concerning\s+for.*pneumonia'],
-        'infection': [r'suspicious\s+for.*infection', r'concerning\s+for.*infectious'],
-        'mass': [r'suspicious.*mass', r'possible\s+mass'],
-    }
-    
-    # Extract uncertain first (highest priority)
-    for attr, patterns in uncertain_patterns.items():
-        for pattern in patterns:
-            if re.search(pattern, text_lower):
-                findings[attr] = -1
+
+    for attr, pats in heuristics.items():
+        attr_key = attr.lower()
+        if attr_key in findings:
+            continue
+        for pat in pats:
+            for m in re.finditer(pat, text_lower):
+                span_start = max(0, m.start() - 120)
+                ctx = text_lower[span_start:m.end()]
+                is_neg, is_unc = _negation_or_uncertain(ctx)
+                if is_unc:
+                    findings[attr_key] = -1
+                elif is_neg:
+                    findings[attr_key] = -2
+                else:
+                    findings[attr_key] = 1
                 break
-    
-    # Extract negative
-    for attr, patterns in negative_patterns.items():
-        if attr not in findings:
-            for pattern in patterns:
-                if re.search(pattern, text_lower):
-                    findings[attr] = -2
-                    break
-    
-    # Extract positive
-    for attr, patterns in positive_patterns.items():
-        if attr not in findings:
-            for pattern in patterns:
-                if re.search(pattern, text_lower):
-                    findings[attr] = 1
-                    break
-    
-    # Object-specific logic
+            if attr_key in findings:
+                break
+
+    # Object-specific tweaks
     obj_lower = object_name.lower()
-    if 'cardiac' in obj_lower:
+    if 'cardiac' in obj_lower or 'cardio' in obj_lower:
         if findings.get('normal') == 1:
             findings['enlarged'] = 0
             findings['cardiomegaly'] = 0
-    
+
     if 'lung' in obj_lower:
         if findings.get('clear') == 1:
             findings.setdefault('consolidation', 0)
             findings.setdefault('opacity', 0)
-    
-    return findings
+
+    # Normalize keys to simple form
+    normalized: Dict[str, int] = {}
+    for k, v in findings.items():
+        key_clean = k.lower().strip()
+        if v in [1, -1, -2]:
+            normalized[key_clean] = int(v)
+
+    return normalized
 
 
 # ============================================================================
@@ -325,8 +312,30 @@ def candidate_extractor_node(state: Dict[str, Any]) -> Dict[str, Any]:
                     candidate_map[obj].append(s)
     
     print(f"[EXTRACT] {len(candidate_map)} objects identified")
+    # Fallback: if no candidates found, create candidate entries for all SG_OBJECTS
+    if not candidate_map:
+        report_text = state.get("report_text", "")
+        for obj in SG_OBJECTS:
+            # try to capture sentences mentioning the object
+            obj_lower = obj.lower()
+            matched = [s for s in sentences if obj_lower in s.lower()]
+            if matched:
+                candidate_map[obj] = matched
+            else:
+                # As a last resort, include full report so rule-based methods can scan globally
+                if report_text:
+                    candidate_map[obj] = [report_text]
+
+    # If LLM is unavailable, ensure we evaluate all objects so dataset is complete
+    if not LLM_AVAILABLE:
+        for obj in SG_OBJECTS:
+            if obj not in candidate_map:
+                report_text = state.get("report_text", "")
+                candidate_map[obj] = [report_text] if report_text else []
+
     state["candidates"] = candidate_map
     return {"candidates": candidate_map}
+
 
 
 def llm_enricher_node(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -336,32 +345,35 @@ def llm_enricher_node(state: Dict[str, Any]) -> Dict[str, Any]:
     candidates = state.get("candidates", {})
     if not candidates:
         return {"findings_dict": {}}
-    
-    findings_dict = {}
-    
+
+    findings_dict: Dict[str, Dict[str, int]] = {}
+
     for obj_name, phrases in candidates.items():
-        combined_text = " ".join(phrases)
-        
+        # Ensure we have a string to analyze
+        combined_text = " ".join([p for p in phrases if p]) if phrases else state.get("report_text", "")
+
         print(f"\n[PROCESS] {obj_name}")
         print(f"  Text: {combined_text[:100]}...")
-        
+
         # 1. Rule-based extraction (baseline)
         rule_findings = extract_findings_rule_based(combined_text, obj_name)
         print(f"  Rule-based: {len(rule_findings)} findings")
-        
-        # 2. LLM extraction (enhancement)
-        llm_findings = extract_findings_llm(combined_text, obj_name, rule_findings)
-        print(f"  LLM: {len(llm_findings)} findings")
-        
-        # 3. Merge: LLM takes precedence, then rules
-        merged = rule_findings.copy()
-        for attr, val in llm_findings.items():
-            # LLM overrides rule-based
-            merged[attr] = val
-        
-        findings_dict[obj_name] = merged
-        print(f"  Final: {len(merged)} findings")
-    
+
+        merged: Dict[str, int] = {k.lower().strip(): int(v) for k, v in rule_findings.items()}
+
+        # 2. LLM extraction (enhancement) if available
+        if LLM_AVAILABLE:
+            llm_findings = extract_findings_llm(combined_text, obj_name, rule_findings)
+            print(f"  LLM: {len(llm_findings)} findings")
+            for attr, val in llm_findings.items():
+                merged[attr.lower().strip()] = int(val)
+        else:
+            print("  LLM not available — using rule-based results only")
+
+        clean_obj = obj_name.lower().strip()
+        findings_dict[clean_obj] = merged
+        print(f"  Final: {len(merged)} findings for {clean_obj}")
+
     state["findings_dict"] = findings_dict
     return {"findings_dict": findings_dict}
 
@@ -372,10 +384,12 @@ def llm_verifier_node(state: Dict[str, Any]) -> Dict[str, Any]:
     """
     findings = state.get("findings_dict", {})
     if not findings or not LLM_AVAILABLE:
-        # Just validate values
-        verified = {}
-        for obj, attrs in findings.items():
-            verified[obj] = {k: v for k, v in attrs.items() if v in [-1, -2, 1]}
+        # Just validate values and ensure all SG_OBJECTS are present (so matrix will be full-dimension)
+        verified: Dict[str, Dict[str, int]] = {}
+        for obj in SG_OBJECTS:
+            clean_obj = obj.lower().strip()
+            attrs = findings.get(clean_obj) or findings.get(obj) or {}
+            verified[clean_obj] = {k.lower().strip(): int(v) for k, v in attrs.items() if v in [-1, -2, 1]}
         state["verified_findings"] = verified
         return {"verified_findings": verified}
     

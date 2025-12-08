@@ -115,44 +115,51 @@ if 'result' in st.session_state:
         objects = metadata['objects']
         attributes = metadata['attributes']
         
-        # Filter options
-        col1, col2, col3 = st.columns(3)
+        # Option to show full fixed-dimension matrix (29×137) or use filters
+        col1, col2 = st.columns([2, 1])
         with col1:
-            show_nonzero_only = st.checkbox("Show only objects with findings", value=True)
+            show_full_matrix = st.checkbox("Show full 29×137 matrix (no column/row filtering)", value=True)
         with col2:
-            filter_category = st.selectbox("Filter by attribute category", 
-                                          ["All"] + list(set(metadata['attribute_categories'].values())))
-        with col3:
-            value_filter = st.selectbox("Filter by value", ["All", "Present (+1)", "Uncertain (-1)", "Explicitly absent (-2)", "Not mentioned (0)"])
-        
-        # Build filtered dataframe
-        df = pd.DataFrame(matrix, index=objects, columns=attributes)
-        
-        # Filter attributes by category
-        if filter_category != "All":
-            attr_cats = metadata['attribute_categories']
-            cols_to_keep = [a for a in attributes if attr_cats.get(a) == filter_category]
-            df = df[cols_to_keep]
-        
-        # Filter rows
-        if show_nonzero_only:
-            mask = (df != 0).any(axis=1)
-            df = df[mask]
-        
-        # Filter by value
-        if value_filter != "All":
-            val_map = {
-                "Present (+1)": 1,
-                "Uncertain (-1)": -1,
-                "Explicitly absent (-2)": -2,
-                "Not mentioned (0)": 0,
-            }
-            target_val = val_map[value_filter]
-            cols_with_val = (df == target_val).any(axis=0)
-            df = df.loc[:, cols_with_val]
-        
-        # Show only columns with non-zero values
-        df = df.loc[:, (df != 0).any(axis=0)]
+            # Keep legacy filtering controls but only active when not showing full matrix
+            show_nonzero_only = st.checkbox("Show only objects with findings", value=False) if not show_full_matrix else False
+
+        # Build dataframe of the full matrix
+        df_full = pd.DataFrame(matrix, index=objects, columns=attributes)
+
+        if show_full_matrix:
+            df = df_full.copy()
+        else:
+            # Filter options (only active when not showing full matrix)
+            col_a, col_b = st.columns(2)
+            with col_a:
+                filter_category = st.selectbox("Filter by attribute category", ["All"] + list(set(metadata['attribute_categories'].values())))
+            with col_b:
+                value_filter = st.selectbox("Filter by value", ["All", "Present (+1)", "Uncertain (-1)", "Explicitly absent (-2)", "Not mentioned (0)"])
+
+            df = df_full.copy()
+
+            # Filter attributes by category
+            if filter_category != "All":
+                attr_cats = metadata['attribute_categories']
+                cols_to_keep = [a for a in attributes if attr_cats.get(a) == filter_category]
+                df = df[cols_to_keep]
+
+            # Filter rows
+            if show_nonzero_only:
+                mask = (df != 0).any(axis=1)
+                df = df[mask]
+
+            # Filter by value
+            if value_filter != "All":
+                val_map = {
+                    "Present (+1)": 1,
+                    "Uncertain (-1)": -1,
+                    "Explicitly absent (-2)": -2,
+                    "Not mentioned (0)": 0,
+                }
+                target_val = val_map[value_filter]
+                cols_with_val = (df == target_val).any(axis=0)
+                df = df.loc[:, cols_with_val]
         
         # Style the dataframe
         def style_cell(val):
@@ -167,12 +174,22 @@ if 'result' in st.session_state:
             return ''
         
         if not df.empty:
-            st.dataframe(
-                df.style.applymap(style_cell),
-                use_container_width=True,
-                height=500
-            )
-            st.caption(f"Showing {df.shape[0]} objects × {df.shape[1]} attributes")
+            # When showing full matrix with many columns, allow horizontal scrolling by setting a large width
+            if show_full_matrix:
+                st.dataframe(
+                    df.style.applymap(style_cell),
+                    use_container_width=False,
+                    width=1600,
+                    height=700
+                )
+                st.caption(f"Showing full matrix: {df.shape[0]} objects × {df.shape[1]} attributes")
+            else:
+                st.dataframe(
+                    df.style.applymap(style_cell),
+                    use_container_width=True,
+                    height=500
+                )
+                st.caption(f"Showing {df.shape[0]} objects × {df.shape[1]} attributes (filtered view)")
         else:
             st.info("No findings match the current filters.")
     
